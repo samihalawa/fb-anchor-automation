@@ -376,3 +376,90 @@ Same as section 5 step 3-4, but iterate over known groups without needing to joi
 - Never skip the 8s warm-up after homepage navigation
 - Never set initial_url to facebook.com (use about:blank)
 - Never look for "Comment"/"Comentar" span text to find comment buttons (use textbox aria-label)
+
+---
+
+## LEARNINGS FROM ALL PRIOR SESSIONS (forensic audit June 2026)
+
+### What WORKED (proven in production)
+
+1. **Anchor Browser + cookie injection with `sameSite:'None'`** — the only reliable remote CDP path. Worked across 6+ sessions in June 2026.
+
+2. **`about:blank` as initial_url** — injecting cookies BEFORE any facebook.com navigation. Setting initial_url to facebook.com caused cookie injection to race and fail silently.
+
+3. **8-second warm-up** on homepage after navigation — skipping caused immediate login redirects on /messages/ and other feature URLs.
+
+4. **Comment textbox discovery via `[contenteditable="true"][role="textbox"]` with aria-label containing "comment"** — this is the ONLY reliable selector. Prior sessions wasted time trying span text matching ("Comment"/"Comentar") which finds elements inside existing comment threads, not the post-level comment action.
+
+5. **`page.keyboard.insertText()`** for typing — handles unicode, emoji, and special chars. `page.type()` and `fill()` both fail on FB's contenteditable divs.
+
+6. **Verification via `div[dir="auto"]` text scan** — checking if the first 30-35 chars of the sent message appear in any visible bubble. Simple and reliable.
+
+7. **Direct URL navigation to threads** (`/messages/t/<id>`) — the ONLY reliable way to open a specific conversation. Rail clicks collapse to the currently-open thread due to virtualization.
+
+8. **Group search → join → scroll → find textbox → comment** — the full pipeline worked end-to-end when run sequentially in a single Anchor session.
+
+9. **`page.mouse.click(x, y)` by coordinates** — more reliable than Playwright locator clicks for FB's obfuscated DOM, especially for comment buttons.
+
+### What FAILED (anti-patterns to avoid)
+
+1. **Local CDP (localhost:9222 / Comet.app)** — cannot be reached from Claude's container. Even from macOS shell, the stale node process holding the CDP socket caused connection timeouts. Desktop Commander + start_process with recursive searches caused 4-minute hangs and connector unresponsiveness.
+
+2. **`[role="row"]` for message extraction** — nests too deep in FB's DOM, always returns empty strings. Only `div[dir="auto"]` works.
+
+3. **Span text matching for comment buttons** ("Comment", "Comentar") — these spans exist inside existing comment reply threads, not as the top-level post comment action. The actual comment entry is a textbox with aria-label.
+
+4. **Rail click navigation** — virtualization makes every click resolve to the same currently-open thread. Must use direct URL.
+
+5. **`take_snapshot` / vision loops in Codex** — triggers 429 rate limits from Anchor. Direct DOM queries only.
+
+6. **`new_page()` in loops** — hits file descriptor ceiling. Reuse one page object.
+
+7. **Subagent swarm for sequential FB work** — overhead, state confusion, "no regression keep going" false positives. Single linear driver only.
+
+8. **Setting initial_url to facebook.com** — cookie injection happens after session creation but before navigation. If the session starts on facebook.com, the first load has no cookies.
+
+9. **`playwright_fill()` on FB textboxes** — fails because FB's React controlled components intercept input events. Only `keyboard.insertText()` works.
+
+10. **`playwright_click()` with CSS selectors on FB** — FB uses obfuscated class names that change between deploys. Overlay divs intercept pointer events (logged as `subtree intercepts pointer events`). Coordinate-based `page.mouse.click()` is more reliable.
+
+11. **Bare curl to facebook.com for session validation** — returns HTTP 400 (FB edge rejects it). Need `--http1.1` plus full browser headers. `USER_ID: "0"` = logged out.
+
+12. **Assuming groups allow immediate commenting after join** — some groups require admin post approval, or are "pending" (need admin to accept membership). The script must check group status after join click.
+
+13. **FB search results for "habitacion madrid"** — returns sponsored/promoted content with broken DOM structure (Episode.living, Habyt ads). Not usable for finding real group posts to comment on.
+
+### What was INEFFICIENT (optimize in future)
+
+1. **Multiple Anchor sessions per task** — each session burns one of the ~6 daily sessions. Combine chat listing + commenting in a single session.
+
+2. **Scrolling without re-querying positions** — after scroll, element positions change. Must re-evaluate DOM positions before clicking.
+
+3. **Hardcoded group IDs that don't exist** — the initial group IDs (1200515470132498, 578525122338402, 1584498498498498) were fabricated, wasting 3 navigation attempts. Always discover groups via search first.
+
+4. **Not joining groups proactively** — the account wasn't a member of any rental groups. The skill should maintain a list of known-good joined groups and try those first.
+
+5. **Cookie re-export friction** — user has to manually export cookies via Cookie-Editor. A future improvement would auto-decrypt from Chrome's cookie store using the Keychain key (proven working in the June 22 session).
+
+### Prior approaches that exist but are NOT part of this skill
+
+- **messagix (Go library)** — headless Messenger via MQTT protocol. Lower ban risk than browser for messages. Built as `fb-cli` in `/Users/samihalawa/git/PROJECTS_ON_PROCESS/fb-cli/` (commit d748cbd). Returns 8+ threads. Good for message-heavy workflows but NOT for group commenting or marketplace listings.
+
+- **mautrix-meta** — full Matrix bridge over messagix. Rejected: requires Synapse homeserver. Too heavy.
+
+- **GeorgiKeranov/facebook-marketplace-bot** — Python cookie-login CSV repost. Only covers marketplace listings, not comments/groups.
+
+- **browser-use / midscene** — generic browser automation. Midscene uses Chrome extension (vision-based). browser-use is headless agentic. Both work but are not FB-specific. This skill uses Anchor Browser + Playwright directly instead.
+
+### Auto-cookie-extraction (proven, optional enhancement)
+
+If the user can't export cookies manually, decrypt from Chrome's cookie store:
+```python
+# macOS only — requires Keychain access (user clicks "Allow")
+import subprocess, sqlite3, hashlib
+key_pw = subprocess.check_output(['security','find-generic-password','-ws','Chrome Safe Storage']).strip()
+key = hashlib.pbkdf2_hmac('sha1', key_pw, b'saltysalt', 1003, 16)
+# ... decrypt encrypted_value from ~/Library/Application Support/Google/Chrome/Default/Cookies
+# Filter: host_key LIKE '%facebook%' AND name IN ('c_user','xs','datr','sb')
+```
+This is NOT part of the Anchor Browser flow (cookies go to Anchor, not local Chrome), but useful for bootstrapping when the user says "just use my Chrome cookies."
