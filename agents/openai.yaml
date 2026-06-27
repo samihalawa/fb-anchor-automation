@@ -1,0 +1,4 @@
+name: fb-anchor-automation
+description: Facebook automation via Anchor Browser CDP - messenger, marketplace, groups, comments
+tools:
+  - type: computer
