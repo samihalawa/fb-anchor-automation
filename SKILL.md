@@ -6,132 +6,159 @@ description: >
   to Marketplace, posting to Facebook Groups, bulk-commenting on group posts, joining groups,
   and searching for rental/room posts to comment on. Use when the user wants to automate any
   Facebook action (messages, marketplace, groups, comments) using Anchor Browser with cookie
-  injection. ALWAYS use Anchor Browser, NEVER use local browser/Comet CDP for this skill.
+  injection. ALWAYS use Anchor Browser, NEVER use local browser/Comet/localhost CDP.
   Triggers: "send to fb", "post to marketplace", "follow up facebook", "reply messenger",
   "post to groups", "bulk comment facebook", "fb automation", "facebook messenger",
-  "facebook grupos", "publicar marketplace", "comment on rental posts", "join fb groups".
+  "facebook grupos", "publicar marketplace", "comment on rental posts", "join fb groups",
+  "list fb chats", "fb messages".
 ---
 
 # fb-anchor-automation
 
-## What This Skill Covers
+## Capabilities
 
-1. **Messenger follow-up** — read + send to threads from prior inquirers by direct thread id
-2. **Marketplace listing** — post a new rental/item listing with photos, price, description
-3. **Group post** — publish text/image post to one or many groups
-4. **Bulk group comments** — comment on recent posts across target groups
-5. **Group join + comment** — search for groups, join them, then comment on rental posts
-6. **Chat listing** — list recent Messenger conversations
-
-All runs through **Anchor Browser (remote CDP)** + `playwright-core`. NEVER use local browser
-(localhost:9222 / Comet). No vision/snapshot loops — direct DOM queries only. One reused `page`
-per session. No `new_page` fan-out (hits fd ceiling).
+1. **List Messenger chats** — extract recent thread IDs, names, previews from Messenger rail
+2. **Messenger follow-up** — read + send to threads by direct thread ID
+3. **Marketplace listing** — post rental/item listing with photos, price, description
+4. **Group post** — publish text/image post to one or many groups
+5. **Group join** — search for groups, request membership
+6. **Group comment** — comment on recent posts in joined groups
+7. **Bulk group comments** — rotate comment variants across multiple groups with pacing
 
 ---
 
-## CRITICAL: ALWAYS USE ANCHOR BROWSER
+## HARD RULES
 
-- **NEVER** connect to `localhost:9222` or any local CDP endpoint
-- **NEVER** use Comet.app or the user's local Chrome for FB automation
-- **ALWAYS** start an Anchor Browser session with cookie injection
-- Cookies must be provided by the user (export from Cookie-Editor extension)
-- If cookies are stale (xs expired), ask the user to re-export — do not fall back to local
+### Transport: Anchor Browser ONLY
+- ALWAYS start an Anchor Browser session via `https://api.anchorbrowser.io/v1/sessions`
+- NEVER connect to `localhost:9222`, Comet.app, or any local CDP endpoint
+- NEVER use the user's local Chrome directly — Anchor provides an isolated remote browser
+- If auth fails (xs expired), ask the user to re-export cookies — do not fall back to local
+
+### Session setup sequence (mandatory, exact order)
+1. Create Anchor session with `initial_url: 'about:blank'` (NOT facebook.com)
+2. Connect via `chromium.connectOverCDP(s.cdp_url)`
+3. Inject cookies with `sameSite: 'None'` BEFORE any facebook.com navigation
+4. Navigate to `https://www.facebook.com/` and wait 8 seconds (mandatory warm-up)
+5. Verify login: check URL does not contain `/login`
+6. Proceed with task
+
+### Cookie requirements
+Minimum cookies needed (user exports via Cookie-Editor Chrome extension):
+- `xs` — session token (primary auth, expires after ~6 Anchor sessions/day)
+- `c_user` — numeric user ID
+- `datr` — device tracking token
+- `sb` — session binding token
+- Optional: `dpr`, `wd`, `presence`, `fr`
+
+All cookies must be mapped to: `domain: '.facebook.com', path: '/', secure: true, sameSite: 'None'`
+
+Raw `sameSite: 'no_restriction'` or `null` from cookie exports causes silent auth failure — must be converted to `'None'`.
+
+### Auto-cookie extraction (optional, macOS only)
+When user cannot manually export cookies, decrypt from Chrome's local cookie store:
+```python
+import subprocess, sqlite3, hashlib
+key_pw = subprocess.check_output(['security','find-generic-password','-ws','Chrome Safe Storage']).strip()
+key = hashlib.pbkdf2_hmac('sha1', key_pw, b'saltysalt', 1003, 16)
+# Decrypt encrypted_value from ~/Library/Application Support/Google/Chrome/Default/Cookies
+# Filter: host_key LIKE '%facebook%' AND name IN ('c_user','xs','datr','sb')
+# AES-128-CBC, IV = b' '*16, strip PKCS7 padding, skip first 3 bytes (v10/v11 prefix)
+```
+A macOS Keychain prompt will appear — user must click Allow. This produces the same cookies that would be manually exported.
 
 ---
 
-## CRITICAL TECHNICAL FACTS (from production runs)
+## Anchor Browser Boilerplate
 
-### Cookie injection — sameSite MUST be 'None'
 ```js
+const { chromium } = require('playwright-core');
+const API = process.env.ANCHOR_API_KEY || '<user provides>';
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function startAnchor() {
+  const r = await fetch('https://api.anchorbrowser.io/v1/sessions', {
+    method: 'POST',
+    headers: { 'anchor-api-key': API, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session: {
+        initial_url: 'about:blank',  // MUST be about:blank
+        timeout: { idle_timeout: 900, max_duration: 2400 }
+      },
+      browser: { headless: { active: false }, viewport: { width: 1280, height: 950 } }
+    })
+  });
+  return (await r.json()).data;
+}
+
+const endAnchor = id => fetch(`https://api.anchorbrowser.io/v1/sessions/${id}`,
+  { method: 'DELETE', headers: { 'anchor-api-key': API } });
+
 const COOKIES = RAW.map(c => ({
   name: c.name, value: c.value,
   domain: '.facebook.com', path: '/',
-  httpOnly: c.httpOnly, secure: true,
-  sameSite: 'None'   // raw 'no_restriction' or null = silent auth failure
+  httpOnly: c.httpOnly ?? true, secure: true,
+  sameSite: 'None'
 }));
-await ctx.addCookies(COOKIES);  // inject BEFORE first navigation
-```
 
-### Required cookies (minimum)
-- `xs` — session token (expires after ~6 Anchor sessions/day)
-- `c_user` — user ID
-- `datr` — device tracking
-- `sb` — session binding
-- Optional: `dpr`, `wd`, `presence`
-
-### Session lifespan: ~6 Anchor sessions/day max
-FB invalidates `xs` token after ~6 new Anchor sessions on same account in one day.
-Detection: homepage shows login redirect or wrong user.
-Fix: re-export fresh cookies from a live logged-in Chrome tab.
-
-### Mandatory warm-up — initial_url MUST be 'about:blank'
-```js
-// Start session with about:blank, NOT facebook.com
-session: { initial_url: 'about:blank', timeout: { idle_timeout: 900, max_duration: 2400 } }
-
-// Then inject cookies BEFORE any facebook navigation
+const s = await startAnchor();
+const b = await chromium.connectOverCDP(s.cdp_url);
+const ctx = b.contexts()[0] || await b.newContext();
 await ctx.addCookies(COOKIES);
-
-// Then warm up on homepage
+const page = ctx.pages()[0] || await ctx.newPage();
 await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded' });
-await sleep(8000);  // must wait — skipping causes immediate login redirect on feature URLs
+await sleep(8000);
+// ... task ...
+await b.close();
+await endAnchor(s.id);
 ```
 
-### Messenger navigation — /messages/t/ auto-redirects to last thread
-When navigating to `https://www.facebook.com/messages/t/` (no ID), FB redirects to the
-most recent thread. This is normal behavior, not an error. The chat rail renders from there.
+---
 
-### Messenger rail virtualization
-The left rail only renders ~2-5 visible threads. Scrolling loads more but extraction is
-limited. To see more threads, scroll the rail container multiple times:
-```js
-for (let scroll = 0; scroll < 6; scroll++) {
-  await page.evaluate(() => {
-    const containers = document.querySelectorAll('[role="navigation"], [aria-label="Chats"]');
-    for (const c of containers) c.scrollTop += 800;
-  });
-  await sleep(1500);
-}
-```
+## DOM Interaction Rules (Facebook-specific)
 
-### Thread extraction — links with /messages/t/
+### Typing text
 ```js
-const links = document.querySelectorAll('a[href*="/messages/t/"]');
-// Extract thread ID from href: /t/(\d+)
-```
-
-### Message bubble extraction — div[dir="auto"] only
-```js
-for (const d of pane.querySelectorAll('div[dir="auto"]')) {
-  const r = d.getBoundingClientRect();
-  if (!r.width) continue;
-  const side = (r.x + r.width / 2) > (window.innerWidth * 0.55) ? 'ME' : 'THEM';
-  msgs.push({ side, t: d.innerText.trim() });
-}
-// ❌ WRONG — [role="row"] nests too deep, always returns empty strings
-```
-
-### Thread navigation — direct URL only
-```js
-await page.goto(`https://www.facebook.com/messages/t/${id}`, { waitUntil: 'domcontentloaded' });
-```
-
-### Composer selectors — try all in order
-```js
-const COMPOSER_SELS = [
-  'div[aria-label="Mensaje"][contenteditable="true"]',
-  'div[aria-label="Message"][contenteditable="true"]',
-  'div[aria-label*="nsaje"][contenteditable="true"]',
-  '[role="textbox"][contenteditable="true"]',
-  'div[contenteditable="true"]',
-];
-```
-
-### Sending + verification
-```js
+// CORRECT — handles unicode, emoji, special chars on FB's React contenteditable
 await box.click(); await sleep(400);
 await page.keyboard.insertText(text);
-await sleep(600);
+
+// WRONG — these fail on FB's controlled components
+await box.fill(text);      // Playwright fill() — silently drops input
+await box.type(text);      // Playwright type() — misses chars, breaks unicode
+```
+
+### Clicking elements
+```js
+// PREFERRED — FB overlays intercept Playwright locator clicks
+await page.mouse.click(x, y);
+
+// FRAGILE — obfuscated classes change between deploys, overlays intercept
+await page.locator('.x9f619.x1ja2u2z').click(); // breaks next week
+```
+Always get coordinates via `getBoundingClientRect()` in `page.evaluate()`, then `page.mouse.click()`.
+
+### After scrolling: re-query positions
+Element positions change after scroll. Always re-evaluate DOM positions before clicking:
+```js
+await page.evaluate(() => window.scrollBy(0, 800));
+await sleep(1000);
+// Re-query positions here — old coordinates are stale
+```
+
+### Message bubble extraction
+```js
+// CORRECT — only reliable selector for FB message text
+document.querySelectorAll('div[dir="auto"]')
+// Filter: check getBoundingClientRect().width > 0 to skip hidden/virtualized nodes
+// Determine side: center_x > 55% of viewport = ME, else = THEM
+
+// WRONG — nests too deep, always returns empty strings
+document.querySelectorAll('[role="row"]')
+```
+
+### Send verification
+```js
 await page.keyboard.press('Enter');
 await sleep(2500);
 const ok = await page.evaluate(frag =>
@@ -141,62 +168,28 @@ const ok = await page.evaluate(frag =>
 );
 ```
 
----
-
-## Anchor Browser Boilerplate
-
+### Dedup consecutive identical bubbles
 ```js
-const { chromium } = require('playwright-core');
-const API = process.env.ANCHOR_API_KEY || 'sk-77fea665b58ee8d7534828fa11a83a21';
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-async function startAnchor() {
-  const r = await fetch('https://api.anchorbrowser.io/v1/sessions', {
-    method: 'POST',
-    headers: { 'anchor-api-key': API, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      session: {
-        initial_url: 'about:blank',  // MUST be about:blank, not facebook.com
-        timeout: { idle_timeout: 900, max_duration: 2400 }
-      },
-      browser: { headless: { active: false }, viewport: { width: 1280, height: 950 } }
-    })
-  });
-  return (await r.json()).data; // { id, cdp_url, live_view_url }
+const dedup = [];
+for (const m of msgs) {
+  if (!dedup.length || dedup[dedup.length - 1].t !== m.t) dedup.push(m);
 }
-
-const endAnchor = id => fetch(`https://api.anchorbrowser.io/v1/sessions/${id}`,
-  { method: 'DELETE', headers: { 'anchor-api-key': API } });
-
-// Standard open
-const s = await startAnchor();
-console.log('SESSION', s.id, 'LIVE', s.live_view_url);
-const b = await chromium.connectOverCDP(s.cdp_url);
-const ctx = b.contexts()[0] || await b.newContext();
-await ctx.addCookies(COOKIES);  // inject BEFORE navigation
-const page = ctx.pages()[0] || await ctx.newPage();
-await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded' });
-await sleep(8000);  // mandatory warm-up
-// ... do work ...
-await b.close();
-await endAnchor(s.id);
 ```
 
 ---
 
-## 1. List Recent Messenger Chats
+## Task: List Messenger Chats
 
-**Trigger**: user wants to see their recent FB conversations.
+Navigate to `/messages/t/` (auto-redirects to most recent thread). Scroll the rail to load more threads. Extract thread links.
 
-After warm-up, navigate to `/messages/t/` and extract thread links from the rail:
 ```js
 await page.goto('https://www.facebook.com/messages/t/', { waitUntil: 'domcontentloaded' });
 await sleep(7000);
 
-// Scroll rail to load more
+// Scroll rail to load more (rail is virtualized, only ~2-5 visible by default)
 for (let i = 0; i < 6; i++) {
   await page.evaluate(() => {
-    const containers = document.querySelectorAll('[role="navigation"], [aria-label="Chats"]');
+    const containers = document.querySelectorAll('[role="navigation"], [aria-label="Chats"], [aria-label="Conversaciones"]');
     for (const c of containers) c.scrollTop += 800;
   });
   await sleep(1500);
@@ -204,15 +197,14 @@ for (let i = 0; i < 6; i++) {
 
 const chats = await page.evaluate(() => {
   const results = [], seen = new Set();
-  const links = document.querySelectorAll('a[href*="/messages/t/"]');
-  for (const a of links) {
+  for (const a of document.querySelectorAll('a[href*="/messages/t/"]')) {
     const m = a.href.match(/\/t\/(\d+)/);
     if (!m || seen.has(m[1])) continue;
     seen.add(m[1]);
     let container = a;
     for (let i = 0; i < 6; i++) { if (container.parentElement) container = container.parentElement; }
-    const spans = [...container.querySelectorAll('span')];
-    const texts = spans.map(s => s.innerText?.trim()).filter(t => t && t.length > 1 && t.length < 120);
+    const texts = [...container.querySelectorAll('span')]
+      .map(s => s.innerText?.trim()).filter(t => t && t.length > 1 && t.length < 120);
     results.push({ id: m[1], name: texts[0] || '?', preview: texts.slice(1,3).join(' · ') });
   }
   return results;
@@ -221,60 +213,90 @@ const chats = await page.evaluate(() => {
 
 ---
 
-## 2. Messenger Follow-up (Prior Inquirers)
+## Task: Send Messenger Message
 
-**Trigger**: user wants to follow up with people who already chatted.
+Navigate directly to thread by ID. Find composer. Type and send.
 
-Navigate directly to `/messages/t/<id>` for each thread. Use composer selectors.
-See boilerplate above for sending + verification.
+```js
+await page.goto(`https://www.facebook.com/messages/t/${threadId}`, { waitUntil: 'domcontentloaded' });
+await sleep(5000);
+
+// Find composer — try selectors in order (locale-dependent)
+const COMPOSER_SELS = [
+  'div[aria-label="Mensaje"][contenteditable="true"]',
+  'div[aria-label="Message"][contenteditable="true"]',
+  'div[aria-label*="nsaje"][contenteditable="true"]',
+  '[role="textbox"][contenteditable="true"]',
+  'div[contenteditable="true"]',
+];
+let box = null;
+for (const sel of COMPOSER_SELS) {
+  try { await page.waitForSelector(sel, { timeout: 4000, state: 'visible' }); box = page.locator(sel).first(); break; }
+  catch(e) {}
+}
+if (!box) throw new Error('NO_COMPOSER — xs likely expired');
+
+await box.click(); await sleep(400);
+await page.keyboard.insertText(messageText);
+await sleep(600);
+await page.keyboard.press('Enter');
+await sleep(2500);
+```
+
+Thread navigation: ALWAYS use direct URL (`/messages/t/<id>`). NEVER click contacts in the left rail — virtualization makes every click resolve to the same currently-open thread.
 
 ---
 
-## 3. Marketplace Listing
+## Task: Marketplace Listing
 
 ```js
 await page.goto('https://www.facebook.com/marketplace/create/rental', { waitUntil: 'domcontentloaded' });
 await sleep(6000);
-// Fill fields, upload images via setInputFiles, submit
+// Category URLs: /marketplace/create/rental, /marketplace/create/item, /marketplace/create/vehicle
+// Fill fields via aria-label selectors, upload images via setInputFiles (NEVER click upload button)
+// After publish: "Listing under review" (held 24h) is normal, not an error
 ```
 
 ---
 
-## 4. Group Post
+## Task: Group Post
 
-Navigate to group, click composer, insertText, submit.
-Min 15s between posts across groups.
+```js
+await page.goto(`https://www.facebook.com/groups/${slug}`, { waitUntil: 'domcontentloaded' });
+await sleep(6000);
+// Click composer: [placeholder*="Write"],[placeholder*="Escribe"],[aria-label*="Write"],[aria-label*="Escribe"]
+// Type with keyboard.insertText()
+// Optional image: setInputFiles on input[type="file"]
+// Submit: [aria-label="Post"],[aria-label="Publicar"]
+// Mandatory: 15s minimum between posts across groups
+```
 
 ---
 
-## 5. Group Join + Comment on Rental Posts (PROVEN WORKFLOW)
+## Task: Group Join + Comment (full pipeline)
 
-**Trigger**: user wants to comment on rental/room posts in FB groups.
-
-### Step 1: Search for groups
+### Step 1: Discover groups
 ```js
 await page.goto('https://www.facebook.com/search/groups/?q=alquiler%20habitaciones%20madrid',
   { waitUntil: 'domcontentloaded' });
 await sleep(6000);
-// Extract group slugs from a[href*="/groups/"]
+// Extract group slugs from a[href*="/groups/"] — filter out "search", "feed", "discover"
 ```
 
-### Step 2: Join groups (click Join button)
+### Step 2: Join groups
 ```js
 await page.goto(`https://www.facebook.com/groups/${slug}`, { waitUntil: 'domcontentloaded' });
 await sleep(5000);
-// Check for join button: [role="button"]:has-text("Join"), [role="button"]:has-text("Unirse")
-// Click it, wait 4s, check if joined or pending
+// Check status:
+//   - [role="button"] text "Join group"/"Unirse" → click to join
+//   - [role="button"] text "Joined"/"Te has unido" → already member
+//   - After join click: check if posts visible (joined) or "pending"/"revisión" (admin approval needed)
+// Some groups have join questions — skip those (need manual intervention)
 ```
 
-### Step 3: Find comment entry points (CRITICAL — proven pattern)
-The comment textbox in group feeds is a `[contenteditable="true"][role="textbox"]` with
-aria-label containing "comment" or "Write a public comment". Do NOT look for spans with
-text "Comment"/"Comentar" — those are often inside existing comment threads, not the
-post-level comment action.
-
+### Step 3: Find comment entry points (CRITICAL — proven selector)
 ```js
-// Scroll to load posts first
+// Scroll to load posts
 for (let i = 0; i < 5; i++) {
   await page.evaluate(() => window.scrollBy(0, 800));
   await sleep(1500);
@@ -282,7 +304,7 @@ for (let i = 0; i < 5; i++) {
 await page.evaluate(() => window.scrollTo(0, 300));
 await sleep(1000);
 
-// Find comment textboxes (PROVEN — this is what works)
+// Find comment textboxes — THE ONLY RELIABLE METHOD
 const commentBoxes = await page.evaluate(() => {
   const results = [];
   const editables = document.querySelectorAll('[contenteditable="true"][role="textbox"]');
@@ -290,79 +312,74 @@ const commentBoxes = await page.evaluate(() => {
     const label = ed.getAttribute('aria-label') || '';
     if (/comment|comentario/i.test(label)) {
       const r = ed.getBoundingClientRect();
-      if (r.width > 50 && r.y > 0) {
+      if (r.width > 50 && r.y > 0)
         results.push({ x: r.x + r.width/2, y: r.y + r.height/2, label });
-      }
     }
   }
   return results;
 });
 ```
 
+**Why this works and alternatives fail:**
+- `span:text("Comment")` / `span:text("Comentar")` — finds spans inside EXISTING comment reply threads, not the top-level post comment entry
+- `[aria-label*="Leave a comment"]` — inconsistently rendered, often behind overlays
+- `[role="textbox"][contenteditable]` with aria-label "comment" — this IS the actual input FB renders below each post
+
 ### Step 4: Type and send comment
 ```js
+await page.evaluate(y => window.scrollTo(0, window.scrollY + y - 400), cb.y);
+await sleep(800);
 await page.mouse.click(cb.x, cb.y);
 await sleep(2000);
-let cbox = page.locator('[contenteditable="true"][role="textbox"]').last();
+
+const cbox = page.locator('[contenteditable="true"][role="textbox"]').last();
 await cbox.waitFor({ state: 'visible', timeout: 3000 });
 await cbox.click(); await sleep(300);
 await page.keyboard.insertText(commentText);
 await sleep(800);
 await page.keyboard.press('Enter');
 await sleep(4000);
-// Verify with div[dir="auto"] check
 ```
 
-### Comment pacing rules
-- Min 12-14s between comments
-- Rotate ≥3 comment variants
-- Max ~10 comments per session total
-- Never identical text to same group twice in <24h
-
-### Known working groups (Madrid rentals, joined June 2026)
-- alquilahabitacionesenmadrid
-- alquilerhabitacionesmadrid
-- madridrent0
-- alquilerparticularesmadrid
-- alquiler.habitaciones.en.madrid (pending approval)
+### Pacing rules (mandatory — FB spam detection)
+- Minimum 12-14 seconds between comments
+- Rotate ≥3 comment text variants
+- Maximum ~10 comments per Anchor session
+- Never post identical text to the same group twice within 24h
+- Minimum 15 seconds between group posts
 
 ---
 
-## 6. Bulk Group Comments (existing member groups)
+## Failure Modes & Fixes
 
-Same as section 5 step 3-4, but iterate over known groups without needing to join.
-
----
-
-## Failure Modes & Exact Fixes
-
-| Symptom | Root cause | Fix |
+| Symptom | Cause | Fix |
 |---|---|---|
-| URL = `/login/?next=...` on any FB page | `xs` cookie expired (>6 Anchor sessions/day) | Re-export fresh cookies from Chrome |
-| Homepage shows wrong user / "Continue" | Same — `xs` dead | Same |
-| Composer `waitForSelector` timeout | xs expired OR FB rate-limited account | Fresh cookies |
-| `MP_ROWS 0` on marketplace folder | MP uses virtual grid, no hrefs | Navigate directly to `/messages/t/<id>` |
-| All rail name-clicks → same thread id | Rail virtualization | Use direct URL nav |
-| `too many open files` | `new_page` in loop | One reused `page`, no parallel `new_page` |
-| 429 from Anchor endpoints | `take_snapshot` in hot loop | Direct DOM only, zero snapshot calls |
-| Group shows "not_member" | Need to join first | Use join flow (section 5 step 2) |
-| Group shows "pending" | Admin approval required | Wait or try different group |
-| 0 comment buttons found in group | Looking for wrong selectors | Use `[contenteditable="true"][role="textbox"]` with aria-label "comment" |
-| Comment button click times out | Stale DOM after scroll | Re-query positions after scrolling |
-| Messenger shows only 2 threads | Rail virtualization | Scroll rail container multiple times |
-| `/messages/t/` redirects to login | Messenger needs fresh xs | Re-export cookies, use about:blank initial_url |
-| initial_url facebook.com breaks auth | Cookie injection happens after session start | Use `about:blank` as initial_url |
+| URL contains `/login/?next=` | `xs` cookie expired or not injected | Re-export fresh cookies; verify sameSite:'None' |
+| Homepage shows wrong user or "Continue" | Same — dead session | Same |
+| Composer waitForSelector timeout | xs expired OR account rate-limited | Fresh cookies; wait 1h if rate-limited |
+| Rail clicks all open same thread | Messenger rail virtualization | Use direct URL: `/messages/t/<id>` |
+| `[role="row"]` returns empty text | Wrong selector for messages | Use `div[dir="auto"]` only |
+| 0 comment buttons found in group | Using span text matching | Use `[contenteditable="true"][role="textbox"]` with aria-label |
+| Comment click times out | Stale coordinates after scroll | Re-query positions via page.evaluate() after scroll |
+| Group shows "not_member" | Not yet joined | Run join flow first |
+| Group shows "pending" | Admin approval required | Skip, try different group |
+| `too many open files` | `new_page()` in loop | Reuse single page object |
+| 429 from Anchor | `take_snapshot` in loop | Direct DOM queries only, no snapshots |
+| `playwright_fill()` drops text | FB React controlled components | Use `keyboard.insertText()` |
+| Overlay intercepts click | Obfuscated div layering | Use `page.mouse.click(x,y)` by coordinates |
+| FB search returns ads only | Sponsored content pollution | Search for groups instead of posts; join groups and comment there |
+| `initial_url: 'facebook.com'` breaks auth | Cookies not yet injected when page loads | Use `initial_url: 'about:blank'` |
+| Bare curl to FB returns 400 | FB edge rejects non-browser requests | Use `--http1.1` + full browser headers; check `USER_ID` in response |
+| Messenger shows only 2 threads | Rail virtualization | Scroll rail container 6+ times with 1.5s gaps |
 
 ---
 
-## Environment Constants
+## Session Economy
 
-- Anchor API key: `sk-77fea665b58ee8d7534828fa11a83a21`
-- FB account: `c_user 61579001435313`
-- Confirmed thread IDs: `1353482306539828`, `1030651092759166`
-- Marketplace inquirers (need id from URL): Yulia Roshchina, Jp Hrez, Daniel García, Ralph Sidali, Enzo Quinteros
-- CORS proxy: `https://cors.trigox.workers.dev?url=<encoded>`
-- Skill repo: `https://github.com/samihalawa/fb-anchor-automation`
+- ~6 Anchor sessions per day per FB account before xs invalidation
+- Combine multiple tasks (chat listing + commenting) in ONE session
+- Never open multiple sessions for the same task
+- End sessions explicitly with DELETE call after work completes
 
 ---
 
@@ -374,92 +391,12 @@ Same as section 5 step 3-4, but iterate over known groups without needing to joi
 - Never use `new_page()` in loops
 - Never hardcode person names in message templates
 - Never skip the 8s warm-up after homepage navigation
-- Never set initial_url to facebook.com (use about:blank)
-- Never look for "Comment"/"Comentar" span text to find comment buttons (use textbox aria-label)
-
----
-
-## LEARNINGS FROM ALL PRIOR SESSIONS (forensic audit June 2026)
-
-### What WORKED (proven in production)
-
-1. **Anchor Browser + cookie injection with `sameSite:'None'`** — the only reliable remote CDP path. Worked across 6+ sessions in June 2026.
-
-2. **`about:blank` as initial_url** — injecting cookies BEFORE any facebook.com navigation. Setting initial_url to facebook.com caused cookie injection to race and fail silently.
-
-3. **8-second warm-up** on homepage after navigation — skipping caused immediate login redirects on /messages/ and other feature URLs.
-
-4. **Comment textbox discovery via `[contenteditable="true"][role="textbox"]` with aria-label containing "comment"** — this is the ONLY reliable selector. Prior sessions wasted time trying span text matching ("Comment"/"Comentar") which finds elements inside existing comment threads, not the post-level comment action.
-
-5. **`page.keyboard.insertText()`** for typing — handles unicode, emoji, and special chars. `page.type()` and `fill()` both fail on FB's contenteditable divs.
-
-6. **Verification via `div[dir="auto"]` text scan** — checking if the first 30-35 chars of the sent message appear in any visible bubble. Simple and reliable.
-
-7. **Direct URL navigation to threads** (`/messages/t/<id>`) — the ONLY reliable way to open a specific conversation. Rail clicks collapse to the currently-open thread due to virtualization.
-
-8. **Group search → join → scroll → find textbox → comment** — the full pipeline worked end-to-end when run sequentially in a single Anchor session.
-
-9. **`page.mouse.click(x, y)` by coordinates** — more reliable than Playwright locator clicks for FB's obfuscated DOM, especially for comment buttons.
-
-### What FAILED (anti-patterns to avoid)
-
-1. **Local CDP (localhost:9222 / Comet.app)** — cannot be reached from Claude's container. Even from macOS shell, the stale node process holding the CDP socket caused connection timeouts. Desktop Commander + start_process with recursive searches caused 4-minute hangs and connector unresponsiveness.
-
-2. **`[role="row"]` for message extraction** — nests too deep in FB's DOM, always returns empty strings. Only `div[dir="auto"]` works.
-
-3. **Span text matching for comment buttons** ("Comment", "Comentar") — these spans exist inside existing comment reply threads, not as the top-level post comment action. The actual comment entry is a textbox with aria-label.
-
-4. **Rail click navigation** — virtualization makes every click resolve to the same currently-open thread. Must use direct URL.
-
-5. **`take_snapshot` / vision loops in Codex** — triggers 429 rate limits from Anchor. Direct DOM queries only.
-
-6. **`new_page()` in loops** — hits file descriptor ceiling. Reuse one page object.
-
-7. **Subagent swarm for sequential FB work** — overhead, state confusion, "no regression keep going" false positives. Single linear driver only.
-
-8. **Setting initial_url to facebook.com** — cookie injection happens after session creation but before navigation. If the session starts on facebook.com, the first load has no cookies.
-
-9. **`playwright_fill()` on FB textboxes** — fails because FB's React controlled components intercept input events. Only `keyboard.insertText()` works.
-
-10. **`playwright_click()` with CSS selectors on FB** — FB uses obfuscated class names that change between deploys. Overlay divs intercept pointer events (logged as `subtree intercepts pointer events`). Coordinate-based `page.mouse.click()` is more reliable.
-
-11. **Bare curl to facebook.com for session validation** — returns HTTP 400 (FB edge rejects it). Need `--http1.1` plus full browser headers. `USER_ID: "0"` = logged out.
-
-12. **Assuming groups allow immediate commenting after join** — some groups require admin post approval, or are "pending" (need admin to accept membership). The script must check group status after join click.
-
-13. **FB search results for "habitacion madrid"** — returns sponsored/promoted content with broken DOM structure (Episode.living, Habyt ads). Not usable for finding real group posts to comment on.
-
-### What was INEFFICIENT (optimize in future)
-
-1. **Multiple Anchor sessions per task** — each session burns one of the ~6 daily sessions. Combine chat listing + commenting in a single session.
-
-2. **Scrolling without re-querying positions** — after scroll, element positions change. Must re-evaluate DOM positions before clicking.
-
-3. **Hardcoded group IDs that don't exist** — the initial group IDs (1200515470132498, 578525122338402, 1584498498498498) were fabricated, wasting 3 navigation attempts. Always discover groups via search first.
-
-4. **Not joining groups proactively** — the account wasn't a member of any rental groups. The skill should maintain a list of known-good joined groups and try those first.
-
-5. **Cookie re-export friction** — user has to manually export cookies via Cookie-Editor. A future improvement would auto-decrypt from Chrome's cookie store using the Keychain key (proven working in the June 22 session).
-
-### Prior approaches that exist but are NOT part of this skill
-
-- **messagix (Go library)** — headless Messenger via MQTT protocol. Lower ban risk than browser for messages. Built as `fb-cli` in `/Users/samihalawa/git/PROJECTS_ON_PROCESS/fb-cli/` (commit d748cbd). Returns 8+ threads. Good for message-heavy workflows but NOT for group commenting or marketplace listings.
-
-- **mautrix-meta** — full Matrix bridge over messagix. Rejected: requires Synapse homeserver. Too heavy.
-
-- **GeorgiKeranov/facebook-marketplace-bot** — Python cookie-login CSV repost. Only covers marketplace listings, not comments/groups.
-
-- **browser-use / midscene** — generic browser automation. Midscene uses Chrome extension (vision-based). browser-use is headless agentic. Both work but are not FB-specific. This skill uses Anchor Browser + Playwright directly instead.
-
-### Auto-cookie-extraction (proven, optional enhancement)
-
-If the user can't export cookies manually, decrypt from Chrome's cookie store:
-```python
-# macOS only — requires Keychain access (user clicks "Allow")
-import subprocess, sqlite3, hashlib
-key_pw = subprocess.check_output(['security','find-generic-password','-ws','Chrome Safe Storage']).strip()
-key = hashlib.pbkdf2_hmac('sha1', key_pw, b'saltysalt', 1003, 16)
-# ... decrypt encrypted_value from ~/Library/Application Support/Google/Chrome/Default/Cookies
-# Filter: host_key LIKE '%facebook%' AND name IN ('c_user','xs','datr','sb')
-```
-This is NOT part of the Anchor Browser flow (cookies go to Anchor, not local Chrome), but useful for bootstrapping when the user says "just use my Chrome cookies."
+- Never set initial_url to facebook.com
+- Never look for "Comment"/"Comentar" span text to find comment buttons
+- Never use `playwright fill()` or `type()` on FB textboxes
+- Never use CSS class selectors on FB (classes are obfuscated and change)
+- Never assume a group allows commenting immediately after joining
+- Never use fabricated/hardcoded group IDs — always discover via search
+- Never rely on FB search results for finding real posts (ads pollute results)
+- Never send more than 10 comments per session
+- Never post identical comment text to the same group within 24h
