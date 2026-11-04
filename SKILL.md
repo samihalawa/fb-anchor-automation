@@ -31,9 +31,8 @@ description: >
 
 ### Transport: Anchor Browser ONLY
 - ALWAYS start an Anchor Browser session via `https://api.anchorbrowser.io/v1/sessions`
-- NEVER connect to `localhost:9222`, Comet.app, or any local CDP endpoint
-- NEVER use the user's local Chrome directly — Anchor provides an isolated remote browser
-- If auth fails (xs expired), ask the user to re-export cookies — do not fall back to local
+- Comet.app is retired; never launch another local Chrome
+- If Anchor auth fails (xs expired, passkey/TOTP wall) or sessions are exhausted, continue on the shared agent Chrome at `127.0.0.1:9222` (LaunchAgent `com.sami.chrome-agent`, logged in as the housing account): connect over CDP, never launch a new one. This is the route verified on 30 Oct 2026. To refresh Anchor, export fresh cookies yourself from that Chrome with CDP `Network.getAllCookies`; never ask Sami to re-export them
 
 ### Session setup sequence (mandatory, exact order)
 1. Create Anchor session with `initial_url: 'about:blank'` (NOT facebook.com)
